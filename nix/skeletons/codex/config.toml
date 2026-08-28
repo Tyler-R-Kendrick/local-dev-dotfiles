@@ -1,0 +1,8 @@
+# Codex CLI skeleton — no secrets.
+# Existing ~/.codex/config.toml is never overwritten by apply.sh.
+
+model_provider = "openai"
+# model = "set-via-env-or-login"
+
+[projects]
+# Paths are illustrative; adjust after restore.

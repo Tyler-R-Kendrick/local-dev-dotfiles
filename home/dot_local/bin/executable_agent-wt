@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+policy=${DEV_POLICY:-"$HOME/.config/dev/policy.yaml"}
+state_root=${XDG_STATE_HOME:-"$HOME/.local/state"}/agent-workspaces
+
+policy_value() {
+	local query=$1 fallback=$2 value
+	value=$(yq -r "$query // \"\"" "$policy" 2>/dev/null || true)
+	[[ -n $value ]] || value=$fallback
+	value=${value/#\~/$HOME}
+	printf '%s\n' "$value"
+}
+
+repo_root() { git rev-parse --show-toplevel; }
+
+repo_name() {
+	local remote
+	remote=$(git config --get remote.origin.url 2>/dev/null || true)
+	if [[ -n $remote ]]; then
+		remote=${remote##*/}
+		printf '%s\n' "${remote%.git}"
+	else
+		basename "$(repo_root)"
+	fi
+}
+
+workspace_path() {
+	printf '%s/%s/%s\n' "$(policy_value '.workspace.root' "$HOME/worktrees")" "$(repo_name)" "$1"
+}
+
+branch_path() {
+	git worktree list --porcelain | awk -v ref="refs/heads/$1" '
+    $1 == "worktree" { path = substr($0, 10) }
+    $1 == "branch" && $2 == ref { print path; exit }
+  '
+}
+
+register_workspace() {
+	local path=$1 branch=$2 source=$3 record id
+	mkdir -p "$state_root"
+	id=$(printf '%s' "$path" | sha256sum | cut -d' ' -f1)
+	record="$state_root/$id.json"
+	jq -n \
+		--arg path "$path" \
+		--arg branch "$branch" \
+		--arg source "$source" \
+		--argjson createdAt "$(date +%s)" \
+		'{path:$path, branch:$branch, source:$source, createdAt:$createdAt}' >"$record"
+}
+
+add_workspace() {
+	local branch=$1 start=${2:-HEAD} source path existing sparse_policy
+	source=$(repo_root)
+	existing=$(branch_path "$branch")
+	if [[ -n $existing ]]; then
+		printf '%s\n' "$existing"
+		return
+	fi
+
+	path=$(workspace_path "$branch")
+  mkdir -p "$(dirname "$path")"
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    git worktree add --quiet "$path" "$branch"
+  else
+    git worktree add --quiet -b "$branch" "$path" "$start"
+  fi
+
+	sparse_policy="$source/$(policy_value '.workspace.sparsePolicy' '.agent/workspace.yaml')"
+	if [[ -f $sparse_policy ]]; then
+		mapfile -t sparse < <(yq -r '.workspace.sparse[]? // empty' "$sparse_policy")
+		if ((${#sparse[@]})); then
+			printf '%s\n' "${sparse[@]}" | git -C "$path" sparse-checkout set --stdin
+		fi
+	fi
+
+	register_workspace "$path" "$branch" "$source"
+	printf '%s\n' "$path"
+}
+
+usage() {
+	cat >&2 <<'EOF'
+usage:
+  agent-wt add BRANCH [START]
+  agent-wt run HARNESS BRANCH [-- ARGS...]
+  agent-wt list
+  agent-wt gc [--apply]
+EOF
+	exit 2
+}
+
+command=${1:-}
+case $command in
+add)
+	[[ $# -ge 2 && $# -le 3 ]] || usage
+	add_workspace "$2" "${3:-HEAD}"
+	;;
+run)
+	[[ $# -ge 3 ]] || usage
+	harness=$2
+	branch=$3
+	shift 3
+	[[ ${1:-} != -- ]] || shift
+	path=$(branch_path "$branch")
+	[[ -n $path ]] || path=$(add_workspace "$branch")
+	cd "$path"
+	exec "$harness" "$@"
+	;;
+list)
+	[[ $# -eq 1 ]] || usage
+	git worktree list
+	;;
+gc)
+	shift
+	exec agent-gc "$@"
+	;;
+*) usage ;;
+esac

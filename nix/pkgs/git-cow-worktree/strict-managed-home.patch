@@ -1,0 +1,174 @@
+diff --git a/e2e_test.go b/e2e_test.go
+index be0bbb4..061aaf0 100644
+--- a/e2e_test.go
++++ b/e2e_test.go
+@@ -430,6 +430,35 @@ func TestE2E_NoCowFilesystem(t *testing.T) {
+ 	diffWorktrees(t, plainOut, cowOut)
+ }
+ 
++func TestE2E_StrictNoCowCleansUp(t *testing.T) {
++	if _, err := exec.LookPath("git"); err != nil {
++		t.Skip("git not on PATH")
++	}
++
++	gitCowWorktree := buildGitCowWorktree(t)
++	r := newRepo(t, "strict")
++	r.commit("a.txt", "alpha")
++	r.branch("target", "HEAD")
++	r.worktree("src", "target")
++
++	out := filepath.Join(r.parent, "out")
++	cmd := exec.Command(gitCowWorktree, "add", "--from", filepath.Join(r.parent, "src"), "--detach", out, "target")
++	cmd.Dir = r.dir
++	cmd.Env = append(os.Environ(),
++		"GIT_COW_WORKTREE_FORCE_NO_COW=1",
++		"GIT_COW_WORKTREE_STRICT_ROOT="+r.parent,
++	)
++	if got, err := cmd.CombinedOutput(); err == nil {
++		t.Fatalf("strict CoW unexpectedly succeeded:\n%s", got)
++	}
++	if _, err := os.Stat(out); !errors.Is(err, fs.ErrNotExist) {
++		t.Fatalf("partial worktree remains: %v", err)
++	}
++	if got := gitOutput(t, r.dir, "worktree", "list", "--porcelain"); strings.Contains(got, out) {
++		t.Fatalf("stale worktree registration remains:\n%s", got)
++	}
++}
++
+ // TestE2E_AutoPickSource verifies the drop-in invariant when git-cow-worktree
+ // auto-selects the source worktree (no --from flag).
+ func TestE2E_AutoPickSource(t *testing.T) {
+diff --git a/main.go b/main.go
+index 2c5ff28..439e7ea 100644
+--- a/main.go
++++ b/main.go
+@@ -47,7 +47,7 @@ func main() {
+ 	}
+ }
+ 
+-func run(args []string) error {
++func run(args []string) (retErr error) {
+ 	opts, err := parseArgs(args)
+ 	if err != nil {
+ 		return err
+@@ -80,6 +80,16 @@ func run(args []string) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	strict := strictTarget(targetAbs)
++	created := false
++	defer func() {
++		if retErr == nil || !strict || !created {
++			return
++		}
++		if err := removeWorktree(repoDir, targetAbs); err != nil {
++			retErr = errors.Join(retErr, err)
++		}
++	}()
+ 
+ 	overallStart := time.Now()
+ 	phase := func(name string, t0 time.Time) {
+@@ -122,6 +132,7 @@ func run(args []string) error {
+ 	if addErr != nil {
+ 		return fmt.Errorf("git worktree add: %w", addErr)
+ 	}
++	created = true
+ 	phase("worktree add", t)
+ 
+ 	// Resolve target SHA from inside the new worktree (HEAD is now set).
+@@ -141,21 +152,32 @@ func run(args []string) error {
+ 			fmt.Fprintf(os.Stderr, "%s: source=%s (diff=%d commits)\n", commandName, a.Src.Path, a.Score)
+ 		}
+ 		var err error
+-		seededIndex, err = seed(a, targetAbs, phase, opts.Verbose)
++		seededIndex, err = seed(a, targetAbs, phase, opts.Verbose, strict)
+ 		if err != nil {
++			if strict {
++				return err
++			}
+ 			// Seeding is an optimization: anything that goes wrong here
+ 			// leaves the working tree to the checkout below.
+ 			if opts.Verbose {
+ 				fmt.Fprintf(os.Stderr, "%s: seeding skipped: %v\n", commandName, err)
+ 			}
+ 		}
+-	} else if opts.Verbose {
+-		fmt.Fprintf(os.Stderr, "%s: no viable source worktree; using plain checkout\n", commandName)
++	} else {
++		if strict {
++			return errors.New("strict CoW required but no viable source worktree exists")
++		}
++		if opts.Verbose {
++			fmt.Fprintf(os.Stderr, "%s: no viable source worktree; using plain checkout\n", commandName)
++		}
+ 	}
+ 
+ 	// Step 6: finalize.
+ 	t = time.Now()
+ 	if err := finalizeCheckout(targetAbs, targetSHA); err != nil {
++		if strict {
++			return err
++		}
+ 		if seededIndex == "" {
+ 			return err
+ 		}
+@@ -288,7 +310,7 @@ func (r *sourceReport) usable() bool {
+ //
+ // Every step is best-effort. Returning an error, or returning nothing,
+ // means the caller's checkout writes the worktree the ordinary way.
+-func seed(a *analysis, targetAbs string, phase func(string, time.Time), verbose bool) (string, error) {
++func seed(a *analysis, targetAbs string, phase func(string, time.Time), verbose, strict bool) (string, error) {
+ 	if a.Err != nil {
+ 		return "", a.Err
+ 	}
+@@ -329,6 +351,9 @@ func seed(a *analysis, targetAbs string, phase func(string, time.Time), verbose
+ 	if result.StopErr != nil {
+ 		return "", fmt.Errorf("stopped cloning: %w", result.StopErr)
+ 	}
++	if strict && (result.Dirs != len(plan.Dirs) || result.Files != len(plan.Files)) {
++		return "", fmt.Errorf("strict CoW cloned %d of %d dirs and %d of %d files", result.Dirs, len(plan.Dirs), result.Files, len(plan.Files))
++	}
+ 	if result.Dirs == 0 && result.Files == 0 {
+ 		return "", nil
+ 	}
+@@ -339,6 +364,18 @@ func seed(a *analysis, targetAbs string, phase func(string, time.Time), verbose
+ 	if verbose {
+ 		fmt.Fprintf(os.Stderr, "%s: verified %d files\n", commandName, len(entries))
+ 	}
++	if strict {
++		expected := 0
++		coverage := plan.coverage()
++		for path, entry := range targetTree.Blobs {
++			if entry.IsRegular() && coverage.covers(path) {
++				expected++
++			}
++		}
++		if len(entries) != expected {
++			return "", fmt.Errorf("strict CoW verified %d of %d cloned files", len(entries), expected)
++		}
++	}
+ 	if len(entries) == 0 {
+ 		return "", nil
+ 	}
+@@ -468,6 +505,21 @@ func execGitWorktreeAdd(args []string) error {
+ 	return cmd.Run()
+ }
+ 
++func strictTarget(target string) bool {
++	root := strings.TrimSpace(os.Getenv("GIT_COW_WORKTREE_STRICT_ROOT"))
++	return root != "" && pathHasPrefix(target, root)
++}
++
++func removeWorktree(repoDir, target string) error {
++	cmd := exec.Command("git", "worktree", "remove", "--force", "--force", target)
++	cmd.Dir = repoDir
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		return fmt.Errorf("cleanup failed: %w (%s)", err, strings.TrimSpace(string(out)))
++	}
++	return nil
++}
++
+ func runGitStreaming(dir string, args ...string) error {
+ 	cmd := exec.Command("git", args...)
+ 	cmd.Dir = dir

@@ -1,0 +1,678 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# One filesystem boundary for every agent harness.  Keep these constants here:
+# qgroups and the sparse image, not per-tool policy, enforce the limits.
+IMAGE=/var/lib/agentfs/agentfs.img
+STATE_DIR=/var/lib/agentfs
+TOP=/run/agentfs/root
+LOOP_FILE=/run/agentfs/loop
+HOME_DIR=/home/codex
+BACKUP=/home/codex.ext4-backup
+UID_CODEX=1000
+GID_CODEX=1000
+IMAGE_SIZE=240G
+AGGREGATE_LIMIT=200G
+HOME_LIMIT=176G
+TMP_LIMIT=16G
+CACHE_LIMIT=32G
+CACHE_ROTATE=24G
+BEES_HASH_SIZE=512M
+BEES_LIMIT=1G
+AGGREGATE_QGROUP=1/100
+MOUNT_OPTIONS=compress-force=zstd:3,noatime,discard=async,space_cache=v2
+BEES_BIN=${AGENTFS_BEES:-bees}
+GIT_COW_BIN=${AGENTFS_GIT_COW:-git-cow-worktree}
+LAKE_COW_BIN=${AGENTFS_LAKE_COW:-lake}
+
+log() { printf '[agentfs] %s\n' "$*"; }
+die() { printf '[agentfs] ERROR: %s\n' "$*" >&2; exit 1; }
+
+root_command() {
+  case "${1:-}" in
+    preflight|install|migrate|boot|unmount|cache-rotate|bees|status|verify|rollback) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+elevate() {
+  local self distro wsl
+  [[ $EUID -eq 0 ]] && return 1
+  self="$(readlink -f "$0")"
+  if sudo -n true 2>/dev/null; then
+    exec sudo "$self" "$@"
+  fi
+  for wsl in /mnt/c/Windows/System32/wsl.exe /mnt/c/WINDOWS/system32/wsl.exe; do
+    [[ -x "$wsl" ]] || continue
+    distro="${WSL_DISTRO_NAME:-CodexUbuntu}"
+    exec "$wsl" -d "$distro" -u root -- "$self" "$@"
+  done
+  die "root required; sudo and wsl.exe -u root are unavailable"
+}
+
+need_root() {
+  [[ $EUID -eq 0 ]] || elevate "$@"
+}
+
+size_bytes() { numfmt --from=iec "$1"; }
+
+validate_layout() {
+  [[ $IMAGE == /var/lib/agentfs/agentfs.img ]] || die "unsafe image path"
+  [[ $HOME_DIR == /home/codex && $BACKUP == /home/codex.ext4-backup ]] || die "unsafe home paths"
+  [[ $TOP == /run/agentfs/root ]] || die "unsafe mount root"
+  local size
+  for size in "$IMAGE_SIZE" "$AGGREGATE_LIMIT" "$HOME_LIMIT" "$TMP_LIMIT" "$CACHE_LIMIT" "$CACHE_ROTATE" "$BEES_HASH_SIZE" "$BEES_LIMIT"; do
+    [[ $size =~ ^[1-9][0-9]*[KMGT]$ ]] || die "invalid size: $size"
+  done
+  (( $(size_bytes "$CACHE_ROTATE") < $(size_bytes "$CACHE_LIMIT") )) || die "cache rotation must precede its hard limit"
+  (( $(size_bytes "$AGGREGATE_LIMIT") < $(size_bytes "$IMAGE_SIZE") )) || die "aggregate limit must fit in image"
+}
+
+require_commands() {
+  local cmd
+  for cmd in btrfs mkfs.btrfs compsize losetup mount mountpoint umount findmnt rsync truncate numfmt sha256sum fstrim timeout git "$GIT_COW_BIN" "$LAKE_COW_BIN"; do
+    command -v "$cmd" >/dev/null || die "missing command: $cmd"
+  done
+}
+
+loop_attach() {
+  local loop
+  mkdir -p "$(dirname "$LOOP_FILE")"
+  loop="$(losetup -j "$IMAGE" | sed -n '1s/:.*//p')"
+  [[ -n $loop ]] || loop="$(losetup --find --show "$IMAGE")"
+  printf '%s\n' "$loop" >"$LOOP_FILE"
+  printf '%s' "$loop"
+}
+
+loop_detach() {
+  local loop=""
+  [[ -f $LOOP_FILE ]] && loop="$(<"$LOOP_FILE")"
+  if [[ -n $loop ]] && losetup "$loop" >/dev/null 2>&1; then
+    losetup -d "$loop"
+  fi
+  rm -f "$LOOP_FILE"
+}
+
+mount_top() {
+  local loop
+  mkdir -p "$TOP"
+  if mountpoint -q "$TOP"; then
+    return
+  fi
+  [[ -f $IMAGE ]] || die "missing image: $IMAGE"
+  loop="$(loop_attach)"
+  mount -t btrfs -o "$MOUNT_OPTIONS,subvolid=5" "$loop" "$TOP"
+  chmod 0700 "$TOP"
+}
+
+unmount_all() {
+  mountpoint -q "$HOME_DIR/.cache" && [[ "$(findmnt -rn -o FSTYPE "$HOME_DIR/.cache")" == btrfs ]] && umount "$HOME_DIR/.cache" || true
+  mountpoint -q /tmp && [[ "$(findmnt -rn -o FSTYPE /tmp)" == btrfs ]] && umount /tmp || true
+  mountpoint -q "$HOME_DIR" && [[ "$(findmnt -rn -o FSTYPE "$HOME_DIR")" == btrfs ]] && umount "$HOME_DIR" || true
+  mountpoint -q "$TOP" && umount "$TOP" || true
+  loop_detach
+}
+
+subvol_id() { btrfs inspect-internal rootid "$1"; }
+
+limit_subvol() {
+  local path=$1 limit=$2 id
+  id="$(subvol_id "$path")"
+  btrfs qgroup limit "$limit" "0/$id" "$TOP"
+  btrfs qgroup assign "0/$id" "$AGGREGATE_QGROUP" "$TOP"
+}
+
+create_layout() {
+  local cache=@cache-0001
+  btrfs quota enable "$TOP"
+  btrfs quota rescan -w "$TOP"
+  btrfs qgroup create "$AGGREGATE_QGROUP" "$TOP"
+  btrfs qgroup limit "$AGGREGATE_LIMIT" "$AGGREGATE_QGROUP" "$TOP"
+  btrfs subvolume create "$TOP/@home"
+  btrfs subvolume create "$TOP/@tmp"
+  btrfs subvolume create "$TOP/$cache"
+  btrfs subvolume create "$TOP/@bees"
+  chown "$UID_CODEX:$GID_CODEX" "$TOP/@home" "$TOP/$cache"
+  chmod 0700 "$TOP/@home" "$TOP/$cache" "$TOP/@bees"
+  chmod 1777 "$TOP/@tmp"
+  truncate -s "$BEES_HASH_SIZE" "$TOP/@bees/beeshash.dat"
+  chmod 0600 "$TOP/@bees/beeshash.dat"
+  limit_subvol "$TOP/@home" "$HOME_LIMIT"
+  limit_subvol "$TOP/@tmp" "$TMP_LIMIT"
+  limit_subvol "$TOP/$cache" "$CACHE_LIMIT"
+  limit_subvol "$TOP/@bees" "$BEES_LIMIT"
+  printf '%s\n' "$cache" >"$STATE_DIR/current-cache"
+}
+
+cache_target() {
+  local cache
+  cache="$(<"$STATE_DIR/current-cache")"
+  [[ $cache =~ ^@cache-[0-9]{4,14}$ ]] || die "invalid cache generation: $cache"
+  printf '%s/%s' "$TOP" "$cache"
+}
+
+promote_cache() {
+  local cache
+  [[ -f $STATE_DIR/next-cache ]] || return
+  cache="$(<"$STATE_DIR/next-cache")"
+  [[ $cache =~ ^@cache-[0-9]{14}$ && -d $TOP/$cache ]] || die "invalid next cache generation"
+  printf '%s\n' "$cache" >"$STATE_DIR/current-cache"
+  rm "$STATE_DIR/next-cache"
+  log "activated cache generation: $cache"
+}
+
+sync_home() {
+  local source=$1 destination=$2 verify=${3:-false} output
+  local -a args=(-aHAXS --numeric-ids --one-file-system --delete --exclude=/.cache --exclude=/.cache/)
+  if [[ $verify == true ]]; then
+    output="$(rsync -nrcHAXS --numeric-ids --one-file-system --delete --itemize-changes --exclude=/.cache --exclude=/.cache/ "$source/" "$destination/")"
+    [[ -z $output ]] || { printf '%s\n' "$output" >&2; die "checksum verification differs"; }
+  else
+    rsync "${args[@]}" "$source/" "$destination/"
+  fi
+}
+
+mount_active() {
+  local loop cache cache_name
+  loop="$(<"$LOOP_FILE")"
+  cache_name="$(<"$STATE_DIR/current-cache")"
+  cache="$(cache_target)"
+  find "$TOP/@tmp" -xdev -mindepth 1 -depth -delete
+  mkdir -p "$HOME_DIR" /tmp
+  chmod 0000 "$HOME_DIR"
+  mount -t btrfs -o "$MOUNT_OPTIONS,subvol=@home" "$loop" "$HOME_DIR"
+  [[ -d $HOME_DIR/.cache && ! -L $HOME_DIR/.cache ]] || die "invalid cache mountpoint in AgentFS home"
+  mount -t btrfs -o "$MOUNT_OPTIONS,subvol=$cache_name" "$loop" "$HOME_DIR/.cache"
+  mount -t btrfs -o "$MOUNT_OPTIONS,subvol=@tmp" "$loop" /tmp
+  chmod 1777 /tmp
+  [[ -d $cache ]] || die "missing cache generation"
+}
+
+delete_old_cache() {
+  local target=$BACKUP/.cache resolved
+  [[ -e $target || -L $target ]] || return
+  mountpoint -q "$target" && die "refusing to delete mounted legacy cache"
+  resolved="$(realpath -m "$target")"
+  [[ $resolved == "$BACKUP/.cache" ]] || die "legacy cache escaped backup home"
+  log "deleting migrated cache only: $target"
+  rm -rf --one-file-system -- "$target"
+}
+
+cutover() {
+  [[ -d $HOME_DIR || -d $BACKUP ]] || die "missing source home"
+  if [[ ! -e $BACKUP ]]; then
+    log "final checksum sync before offline cutover"
+    sync_home "$HOME_DIR" "$TOP/@home"
+    sync_home "$HOME_DIR" "$TOP/@home" true
+    mv "$HOME_DIR" "$BACKUP"
+    install -d -m 0000 -o root -g root "$HOME_DIR"
+  else
+    [[ -e $HOME_DIR ]] || install -d -m 0000 -o root -g root "$HOME_DIR"
+    [[ $(stat -c '%u:%g:%a' "$HOME_DIR") == 0:0:0 ]] || die "cannot resume interrupted cutover"
+    [[ -z $(find "$HOME_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]] || die "cutover mountpoint is not empty"
+    log "resuming interrupted cutover"
+  fi
+  mount_active
+  delete_old_cache
+  printf 'active\n' >"$STATE_DIR/state"
+  touch "$STATE_DIR/active"
+  rm -f "$STATE_DIR/pending"
+  log "cutover complete; rollback copy retained at $BACKUP"
+}
+
+rollback_boot() {
+  [[ -d $BACKUP ]] || die "rollback copy missing: $BACKUP"
+  log "syncing current durable AgentFS home into rollback copy"
+  sync_home "$TOP/@home" "$BACKUP"
+  sync_home "$TOP/@home" "$BACKUP" true
+  rmdir "$HOME_DIR"
+  mv "$BACKUP" "$HOME_DIR"
+  rm -f "$STATE_DIR/pending" "$STATE_DIR/active"
+  printf 'rolled-back\n' >"$STATE_DIR/state"
+  unmount_all
+  systemctl disable agentfs.service agentfs-bees.service agentfs-cache-rotate.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/user@1000.service.d/agentfs.conf
+  systemctl daemon-reload
+  log "rollback complete; AgentFS image retained at $IMAGE"
+}
+
+cmd_boot() {
+  need_root boot
+  validate_layout
+  require_commands
+  mount_top
+  case "$(cat "$STATE_DIR/pending" 2>/dev/null || true)" in
+    cutover) cutover ;;
+    rollback) rollback_boot ;;
+    "")
+      [[ "$(cat "$STATE_DIR/state" 2>/dev/null || true)" == active ]] || die "neither active nor staged"
+      promote_cache
+      mount_active
+      prune_caches
+      ;;
+    *) die "invalid pending action" ;;
+  esac
+}
+
+write_unit() {
+  local path=$1 content=$2 tmp
+  install -d -m 0755 "$(dirname "$path")"
+  tmp="$(mktemp "${path}.XXXXXX")"
+  printf '%s\n' "$content" >"$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+install_units() {
+  local self package_root
+  self="$(readlink -f "$0")"
+  package_root="$(dirname "$(dirname "$self")")"
+  mkdir -p /nix/var/nix/gcroots /usr/local/sbin
+  ln -sfn "$package_root" /nix/var/nix/gcroots/agentfs
+  ln -sfn "$self" /usr/local/sbin/agentfsctl
+
+  write_unit /etc/systemd/system/agentfs.service '[Unit]
+Description=AgentFS bounded Btrfs home
+DefaultDependencies=no
+After=local-fs-pre.target
+Before=local-fs.target user@1000.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/agentfsctl boot
+ExecStop=/usr/local/sbin/agentfsctl unmount
+TimeoutStartSec=infinity
+
+[Install]
+RequiredBy=local-fs.target'
+
+  write_unit /etc/systemd/system/agentfs-bees.service '[Unit]
+Description=AgentFS continuous block deduplication
+Requires=agentfs.service
+After=agentfs.service
+ConditionPathExists=/var/lib/agentfs/active
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/agentfsctl bees
+Restart=on-failure
+RestartSec=30
+Nice=19
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target'
+
+  write_unit /etc/systemd/system/agentfs-cache-rotate.service '[Unit]
+Description=Rotate AgentFS cache generation near quota
+Requires=agentfs.service
+After=agentfs.service
+ConditionPathExists=/var/lib/agentfs/active
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/agentfsctl cache-rotate'
+
+  write_unit /etc/systemd/system/agentfs-cache-rotate.timer '[Unit]
+Description=Check AgentFS cache usage hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target'
+
+  systemctl daemon-reload
+}
+
+enable_units() {
+  install -d -m 0755 /etc/systemd/system/user@1000.service.d
+  write_unit /etc/systemd/system/user@1000.service.d/agentfs.conf '[Unit]
+Requires=agentfs.service
+After=agentfs.service'
+  systemctl enable agentfs.service agentfs-bees.service agentfs-cache-rotate.timer >/dev/null
+  systemctl daemon-reload
+}
+
+cmd_install() {
+  need_root install
+  validate_layout
+  install_units
+  log "installed controller and units; nothing enabled until migration is staged"
+}
+
+migration_abort() {
+  local status=$?
+  trap - EXIT
+  unmount_all
+  if (( status != 0 )) && [[ ! -e $BACKUP ]] && [[ "$(cat "$STATE_DIR/state" 2>/dev/null || true)" != staged ]]; then
+    log "removing incomplete migration image"
+    rm -f -- "$IMAGE" "$STATE_DIR/current-cache"
+  fi
+  exit "$status"
+}
+
+cmd_migrate() {
+  need_root migrate
+  validate_layout
+  require_commands
+  [[ ! -e $IMAGE ]] || die "image already exists: $IMAGE"
+  [[ ! -e $BACKUP ]] || die "backup already exists: $BACKUP"
+  [[ ! -e $STATE_DIR/pending ]] || die "migration already pending"
+  mountpoint -q "$HOME_DIR" && die "home is already a mountpoint"
+  local available durable reserve
+  available="$(df --output=avail -B1 / | tail -n 1)"
+  durable="$(du -sx -B1 --exclude=.cache "$HOME_DIR" | awk '{print $1}')"
+  reserve="$(size_bytes 8G)"
+  (( available > durable + reserve )) || die "insufficient ext4 space to retain the rollback home"
+  install_units
+  install -d -m 0700 "$STATE_DIR"
+  trap migration_abort EXIT
+  truncate -s "$IMAGE_SIZE" "$IMAGE"
+  chmod 0600 "$IMAGE"
+  local loop
+  loop="$(loop_attach)"
+  mkfs.btrfs -q -f -L agentfs "$loop"
+  install -d -m 0700 "$TOP"
+  mount -t btrfs -o "$MOUNT_OPTIONS,subvolid=5" "$loop" "$TOP"
+  chmod 0700 "$TOP"
+  create_layout
+  log "copying durable home; .cache is intentionally excluded"
+  sync_home "$HOME_DIR" "$TOP/@home"
+  install -d -m 0000 -o root -g root "$TOP/@home/.cache"
+  sync
+  unmount_all
+  trap - EXIT
+  printf 'staged\n' >"$STATE_DIR/state"
+  printf 'cutover\n' >"$STATE_DIR/pending"
+  enable_units
+  log "migration staged; offline cutover will perform the final checksum verification"
+  log "from Windows run: wsl --shutdown; the next boot performs the final sync and atomic cutover"
+}
+
+cmd_unmount() {
+  need_root unmount
+  unmount_all
+}
+
+qgroup_bytes() {
+  local path=$1 id
+  id="0/$(subvol_id "$path")"
+  btrfs qgroup show --raw "$TOP" | awk -v id="$id" '$1 == id {print $2; exit}'
+}
+
+prune_caches() {
+  local current next path name
+  current="$(<"$STATE_DIR/current-cache")"
+  next="$(cat "$STATE_DIR/next-cache" 2>/dev/null || true)"
+  while IFS= read -r path; do
+    name="$(basename "$path")"
+    [[ $name == "$current" || $name == "$next" ]] && continue
+    btrfs subvolume delete "$path"
+  done < <(find "$TOP" -maxdepth 1 -mindepth 1 -type d -name '@cache-*' -printf '%T@ %p\n' | sort -nr | cut -d' ' -f2-)
+}
+
+cmd_cache_rotate() {
+  need_root cache-rotate
+  [[ "$(cat "$STATE_DIR/state" 2>/dev/null || true)" == active ]] || die "AgentFS is not active"
+  mountpoint -q "$TOP" || die "AgentFS root is not mounted"
+  local current bytes generation target
+  current="$(<"$STATE_DIR/current-cache")"
+  bytes="$(qgroup_bytes "$TOP/$current")"
+  [[ $bytes =~ ^[0-9]+$ ]] || die "cannot read cache qgroup"
+  if (( bytes < $(size_bytes "$CACHE_ROTATE") )); then
+    prune_caches
+    log "cache below rotation threshold: $bytes bytes"
+    return
+  fi
+  if [[ -f $STATE_DIR/next-cache ]]; then
+    log "cache rotation already prepared: $(<"$STATE_DIR/next-cache")"
+    return
+  fi
+  generation="@cache-$(date -u +%Y%m%d%H%M%S)"
+  target="$TOP/$generation"
+  btrfs subvolume create "$target"
+  chown "$UID_CODEX:$GID_CODEX" "$target"
+  chmod 0700 "$target"
+  limit_subvol "$target" "$CACHE_LIMIT"
+  printf '%s\n' "$generation" >"$STATE_DIR/next-cache"
+  prune_caches
+  log "prepared cache rotation: $current -> $generation; activates next boot"
+}
+
+cmd_bees() {
+  need_root bees
+  mountpoint -q "$TOP" || die "AgentFS root is not mounted"
+  export BEESHOME=@bees
+  exec ionice -c3 "$BEES_BIN" --no-timestamps --thread-count 2 --loadavg-target 4 --thread-min 1 --throttle-factor 4 "$TOP"
+}
+
+preflight_cleanup() {
+  local dir=$1 loop=${2:-}
+  mountpoint -q "$dir/mnt" && umount "$dir/mnt" || true
+  [[ -n $loop ]] && losetup "$loop" >/dev/null 2>&1 && losetup -d "$loop" || true
+  rm -rf --one-file-system -- "$dir"
+}
+
+cmd_preflight() {
+  need_root preflight
+  validate_layout
+  require_commands
+  modprobe btrfs
+  local image before after compressed uncompressed shared cow_shared source_sum lake_shared bees_pid=0
+  PF_DIR="$(mktemp -d /var/lib/agentfs-preflight.XXXXXX)"
+  image=$PF_DIR/image
+  mkdir "$PF_DIR/mnt"
+  PF_LOOP=""
+  trap 'preflight_cleanup "$PF_DIR" "$PF_LOOP"' EXIT
+  truncate -s 4G "$image"
+  PF_LOOP="$(losetup --find --show "$image")"
+  mkfs.btrfs -q -f "$PF_LOOP"
+  mount -t btrfs -o "$MOUNT_OPTIONS,subvolid=5" "$PF_LOOP" "$PF_DIR/mnt"
+  btrfs quota enable "$PF_DIR/mnt"
+  btrfs quota rescan -w "$PF_DIR/mnt"
+  btrfs subvolume create "$PF_DIR/mnt/test"
+  btrfs qgroup limit 2G "0/$(subvol_id "$PF_DIR/mnt/test")" "$PF_DIR/mnt"
+
+  mkdir "$PF_DIR/mnt/repo"
+  git -C "$PF_DIR/mnt/repo" init -q
+  git -C "$PF_DIR/mnt/repo" config user.email agentfs@example.invalid
+  git -C "$PF_DIR/mnt/repo" config user.name AgentFS
+  dd if=/dev/urandom of="$PF_DIR/mnt/repo/tracked" bs=1M count=4 status=none
+  git -C "$PF_DIR/mnt/repo" add tracked
+  git -C "$PF_DIR/mnt/repo" commit -qm seed
+  (
+    cd "$PF_DIR/mnt/repo"
+    GIT_COW_WORKTREE_STRICT_ROOT="$PF_DIR/mnt" "$GIT_COW_BIN" add --detach "$PF_DIR/mnt/worktree" HEAD
+  )
+  sync
+  cow_shared="$(btrfs filesystem du --raw "$PF_DIR/mnt/repo/tracked" "$PF_DIR/mnt/worktree/tracked" | awk '$1 ~ /^[0-9]+$/ {value+=$3} END {print value+0}')"
+  (( cow_shared > 0 )) || die "git worktree files do not share Btrfs extents"
+  source_sum="$(sha256sum "$PF_DIR/mnt/repo/tracked" | awk '{print $1}')"
+  printf mutation >>"$PF_DIR/mnt/worktree/tracked"
+  [[ $(sha256sum "$PF_DIR/mnt/repo/tracked" | awk '{print $1}') == "$source_sum" ]] || die "worktree mutation changed its CoW source"
+  if (
+    cd "$PF_DIR/mnt/repo"
+    GIT_COW_WORKTREE_FORCE_NO_COW=1 GIT_COW_WORKTREE_STRICT_ROOT="$PF_DIR/mnt" "$GIT_COW_BIN" add --detach "$PF_DIR/mnt/failed-worktree" HEAD
+  ) >"$PF_DIR/git-cow-failure.log" 2>&1; then
+    die "strict git worktree unexpectedly fell back to a full checkout"
+  fi
+  [[ ! -e $PF_DIR/mnt/failed-worktree ]] || die "failed git worktree was not removed"
+  git -C "$PF_DIR/mnt/repo" worktree list --porcelain | grep -Fq "worktree $PF_DIR/mnt/failed-worktree" && die "failed git worktree registration remains"
+
+  btrfs subvolume create "$PF_DIR/mnt/cache"
+  mkdir "$PF_DIR/mnt/lake-a" "$PF_DIR/mnt/lake-b"
+  printf '%s\n' '{"version":"1.2.0","packages":[]}' >"$PF_DIR/mnt/lake-a/lake-manifest.json"
+  cp "$PF_DIR/mnt/lake-a/lake-manifest.json" "$PF_DIR/mnt/lake-b/lake-manifest.json"
+  printf '%s\n' 'leanprover/lean4:v4.30.0' >"$PF_DIR/mnt/lake-a/lean-toolchain"
+  cp "$PF_DIR/mnt/lake-a/lean-toolchain" "$PF_DIR/mnt/lake-b/lean-toolchain"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    'mkdir -p .lake/packages/mathlib' \
+    "if [[ \${EXPECT_SEED:-0} == 1 ]]; then [[ -f .lake/packages/mathlib/shared ]]; fi" \
+    'if [[ ! -f .lake/packages/mathlib/shared ]]; then dd if=/dev/urandom of=.lake/packages/mathlib/shared bs=1M count=4 status=none; fi' \
+    >"$PF_DIR/fake-lake"
+  chmod +x "$PF_DIR/fake-lake"
+  (
+    cd "$PF_DIR/mnt/lake-a"
+    PACKAGE_CACHE_HOME="$PF_DIR/mnt/cache" AGENTFS_REAL_LAKE="$PF_DIR/fake-lake" "$LAKE_COW_BIN" build
+  )
+  (
+    cd "$PF_DIR/mnt/lake-b"
+    EXPECT_SEED=1 PACKAGE_CACHE_HOME="$PF_DIR/mnt/cache" AGENTFS_REAL_LAKE="$PF_DIR/fake-lake" "$LAKE_COW_BIN" build
+  )
+  sync
+  lake_shared="$(btrfs filesystem du --raw "$PF_DIR/mnt/lake-a/.lake/packages/mathlib/shared" "$PF_DIR/mnt/lake-b/.lake/packages/mathlib/shared" | awk '$1 ~ /^[0-9]+$/ {value+=$3} END {print value+0}')"
+  (( lake_shared > 0 )) || die "Lake package seeds do not share Btrfs extents"
+  source_sum="$(sha256sum "$PF_DIR/mnt/lake-a/.lake/packages/mathlib/shared" | awk '{print $1}')"
+  printf mutation >>"$PF_DIR/mnt/lake-b/.lake/packages/mathlib/shared"
+  [[ $(sha256sum "$PF_DIR/mnt/lake-a/.lake/packages/mathlib/shared" | awk '{print $1}') == "$source_sum" ]] || die "Lake package mutation changed its CoW source"
+
+  mkdir "$PF_DIR/mnt/.beeshome"
+  truncate -s 1M "$PF_DIR/mnt/.beeshome/beeshash.dat"
+  chmod 0600 "$PF_DIR/mnt/.beeshome/beeshash.dat"
+  dd if=/dev/zero of="$PF_DIR/mnt/test/compressed" bs=1M count=64 conv=fsync status=none
+  read -r compressed uncompressed < <(compsize -b "$PF_DIR/mnt/test/compressed" | awk '$1 == "TOTAL" {print $3, $4}')
+  [[ $compressed =~ ^[0-9]+$ && $uncompressed =~ ^[0-9]+$ ]] || die "could not measure compressed extents"
+  (( compressed * 4 < uncompressed )) || die "zstd compression did not reduce physical allocation"
+  rm "$PF_DIR/mnt/test/compressed"
+  dd if=/dev/urandom of="$PF_DIR/mnt/test/a" bs=128K count=1 status=none
+  cp --reflink=never "$PF_DIR/mnt/test/a" "$PF_DIR/mnt/test/b"
+  sync
+  BEESHOME=.beeshome "$BEES_BIN" --no-timestamps --thread-count 1 "$PF_DIR/mnt" >"$PF_DIR/bees.log" 2>&1 &
+  bees_pid=$!
+  shared=0
+  for _ in $(seq 1 120); do
+    shared="$(btrfs filesystem du --raw "$PF_DIR/mnt/test/a" "$PF_DIR/mnt/test/b" | awk '$1 ~ /^[0-9]+$/ {value+=$3} END {print value+0}')"
+    kill -0 "$bees_pid" 2>/dev/null || break
+    [[ ${shared:-0} =~ ^[0-9]+$ ]] && (( shared > 0 )) && break
+    sleep 1
+  done
+  kill "$bees_pid" 2>/dev/null || true
+  wait "$bees_pid" 2>/dev/null || true
+  if (( shared == 0 )); then
+    tail -n 40 "$PF_DIR/bees.log" >&2
+    die "bees did not deduplicate the test files"
+  fi
+  dd if=/dev/urandom of="$PF_DIR/mnt/test/discard" bs=1M count=64 conv=fsync status=none
+  sync
+  before="$(du -B1 "$image" | awk '{print $1}')"
+  rm "$PF_DIR/mnt/test/discard"
+  sync
+  fstrim "$PF_DIR/mnt"
+  sync
+  after="$(du -B1 "$image" | awk '{print $1}')"
+  (( after < before )) || die "loop discard did not release backing-file blocks"
+  umount "$PF_DIR/mnt"
+  losetup -d "$PF_LOOP"
+  PF_LOOP="$(losetup --find --show "$image")"
+  mount -t btrfs -o "$MOUNT_OPTIONS,subvolid=5" "$PF_LOOP" "$PF_DIR/mnt"
+  [[ -f $PF_DIR/mnt/test/a ]] || die "remount lost test data"
+  btrfs filesystem usage "$PF_DIR/mnt" >/dev/null
+  log "preflight passed: CoW worktrees, compression, qgroups, bees dedupe, discard, and remount"
+}
+
+status_value() {
+  local state pending image_allocated home_fs top_fs cache
+  state="$(cat "$STATE_DIR/state" 2>/dev/null || echo absent)"
+  pending="$(cat "$STATE_DIR/pending" 2>/dev/null || echo none)"
+  image_allocated=0
+  [[ -f $IMAGE ]] && image_allocated="$(du -B1 "$IMAGE" | awk '{print $1}')"
+  home_fs="$(findmnt -rn -o FSTYPE "$HOME_DIR" 2>/dev/null || echo ext4)"
+  if mountpoint -q "$TOP"; then
+    top_fs="$(findmnt -rn -o FSTYPE "$TOP")"
+  else
+    top_fs=unmounted
+  fi
+  cache="$(cat "$STATE_DIR/current-cache" 2>/dev/null || echo none)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$state" "$pending" "$image_allocated" "$home_fs" "$top_fs" "$cache"
+}
+
+path_bytes() {
+  local path=$1
+  if [[ -e $path ]]; then
+    du -sx -B1 "$path" 2>/dev/null | awk '{print $1}'
+  else
+    printf '0\n'
+  fi
+}
+
+cmd_status() {
+  local state pending allocated home_fs top_fs cache cursor_bytes claude_bytes codex_bytes
+  IFS=$'\t' read -r state pending allocated home_fs top_fs cache < <(status_value)
+  cursor_bytes="$(path_bytes "$HOME_DIR/.cursor")"
+  claude_bytes="$(path_bytes "$HOME_DIR/.claude")"
+  codex_bytes="$(path_bytes "$HOME_DIR/.codex")"
+  if [[ ${1:-} == --json ]]; then
+    jq -n --arg state "$state" --arg pending "$pending" --argjson imageAllocatedBytes "$allocated" --arg homeFilesystem "$home_fs" --arg topFilesystem "$top_fs" --arg cacheGeneration "$cache" --argjson cursorBytes "$cursor_bytes" --argjson claudeBytes "$claude_bytes" --argjson codexBytes "$codex_bytes" \
+      '{state:$state,pending:$pending,imageAllocatedBytes:$imageAllocatedBytes,homeFilesystem:$homeFilesystem,topFilesystem:$topFilesystem,cacheGeneration:$cacheGeneration,agentStateBytes:{cursor:$cursorBytes,claude:$claudeBytes,codex:$codexBytes}}'
+  else
+    printf 'state=%s pending=%s image_allocated=%s home_fs=%s top_fs=%s cache=%s\n' "$state" "$pending" "$allocated" "$home_fs" "$top_fs" "$cache"
+    printf 'agent_state_bytes cursor=%s claude=%s codex=%s\n' "$cursor_bytes" "$claude_bytes" "$codex_bytes"
+  fi
+}
+
+cmd_verify() {
+  need_root verify
+  [[ "$(cat "$STATE_DIR/state" 2>/dev/null || true)" == active ]] || die "AgentFS is not active"
+  mountpoint -q "$HOME_DIR" || die "home is not a mountpoint"
+  mountpoint -q /tmp || die "/tmp is not a mountpoint"
+  mountpoint -q "$TOP" || die "root subvolume is not a mountpoint"
+  [[ $(findmnt -rn -o FSTYPE "$HOME_DIR") == btrfs ]] || die "home is not Btrfs"
+  mountpoint -q "$HOME_DIR/.cache" || die "cache is not a mountpoint"
+  [[ $(findmnt -rn -o FSTYPE "$HOME_DIR/.cache") == btrfs ]] || die "cache is not Btrfs"
+  [[ $(findmnt -rn -o FSTYPE /tmp) == btrfs ]] || die "/tmp is not Btrfs"
+  [[ $(findmnt -rn -o FSTYPE "$TOP") == btrfs ]] || die "root subvolume is not mounted"
+  [[ $(findmnt -rn -o FSROOT "$HOME_DIR/.cache") == "/$(<"$STATE_DIR/current-cache")" ]] || die "cache generation mount drifted"
+  btrfs qgroup show -reF "$TOP" | grep -q "$AGGREGATE_QGROUP" || die "aggregate qgroup missing"
+  systemctl is-enabled agentfs.service agentfs-bees.service agentfs-cache-rotate.timer >/dev/null
+  [[ -e /nix/var/nix/gcroots/agentfs ]] || die "AgentFS package is not a GC root"
+  log "verified mounts, cache generation, qgroups, units, and package GC root"
+}
+
+cmd_rollback() {
+  need_root rollback
+  [[ "$(cat "$STATE_DIR/state" 2>/dev/null || true)" == active ]] || die "AgentFS is not active"
+  [[ -d $BACKUP ]] || die "rollback copy missing: $BACKUP"
+  printf 'rollback\n' >"$STATE_DIR/pending"
+  log "rollback staged; from Windows run: wsl --shutdown"
+}
+
+cmd_selftest() {
+  validate_layout
+  [[ $(size_bytes 1G) == 1073741824 ]]
+  [[ $(size_bytes "$CACHE_ROTATE") -lt $(size_bytes "$CACHE_LIMIT") ]]
+  [[ $AGGREGATE_QGROUP =~ ^[0-9]+/[0-9]+$ ]]
+  log "selftest passed"
+}
+
+usage() {
+  printf 'usage: agentfsctl {selftest|preflight|install|migrate|status [--json]|verify|rollback}\n' >&2
+  exit 2
+}
+
+main() {
+  local command=${1:-}
+  shift || true
+  root_command "$command" && [[ $EUID -ne 0 ]] && elevate "$command" "$@"
+  case "$command" in
+    selftest) cmd_selftest "$@" ;;
+    preflight) cmd_preflight "$@" ;;
+    install) cmd_install "$@" ;;
+    migrate) cmd_migrate "$@" ;;
+    boot) cmd_boot "$@" ;;
+    unmount) cmd_unmount "$@" ;;
+    cache-rotate) cmd_cache_rotate "$@" ;;
+    bees) cmd_bees "$@" ;;
+    status) cmd_status "$@" ;;
+    verify) cmd_verify "$@" ;;
+    rollback) cmd_rollback "$@" ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"
