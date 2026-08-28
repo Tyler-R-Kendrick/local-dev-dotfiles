@@ -1,0 +1,17 @@
+.result
+result
+.direnv/
+.devenv/
+.headroom-cache/
+*.swp
+.DS_Store
+
+# Never commit secrets or local unlock state
+.env
+.env.*
+BW_SESSION
+*.pem
+*.key
+id_rsa
+id_ed25519
+!skeletons/**/

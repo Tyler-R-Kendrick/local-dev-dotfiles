@@ -1,0 +1,10 @@
+workspace:
+  root: ~/worktrees
+  sparsePolicy: .agent/workspace.yaml
+  staleDays: 7
+cache:
+  root: ~/.cache/packages
+  sccacheMax: 4G
+cleanup:
+  dryRun: true
+  requireMerged: true

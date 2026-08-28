@@ -1,0 +1,76 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+flake := "."
+host := "codex@copilotpro7"
+
+default:
+  @just --list
+
+# Install Determinate Nix (systemd WSL required)
+bootstrap-nix:
+  bash scripts/bootstrap/install-determinate-nix.sh
+
+nh-switch:
+  nh home switch --backup-extension backup {{flake}} -c {{host}}
+
+# First or subsequent Home Manager switch (backs up conflicting files)
+switch *ARGS:
+  bash scripts/bootstrap/first-switch.sh {{ARGS}}
+
+# Apply agent skeletons (non-destructive)
+agents:
+  bash scripts/agents/apply.sh
+
+# Install / refresh Muse Code (Meta vendor installer)
+muse:
+  bash scripts/agents/install-muse.sh
+
+# Clone repos with URLs in ~/.agents/repos.map
+repos:
+  bash scripts/agents/clone-repos.sh
+
+# Restore secrets from Bitwarden (requires BW_SESSION)
+secrets map="":
+  bash scripts/secrets/restore.sh {{map}}
+
+# Full post-nix activate path (HM switch + agents; secrets separate)
+activate: switch agents
+  @echo "Optional: export BW_SESSION=\$(bw unlock --raw) && just secrets ~/.config/dev/secrets-map.md"
+
+# Interactive one-shot: Determinate Nix + switch + agents (needs sudo password)
+activate-all:
+  bash scripts/bootstrap/activate-all.sh
+
+# Format nix files
+fmt:
+  nix fmt
+
+# Evaluate / build checks
+check:
+  nix flake check --no-pure-eval
+
+# Build and run the disposable Btrfs/qgroup/dedupe/discard proof as root.
+agentfs-preflight:
+  nix run .#agentfs -- preflight
+
+# Stage the verified home migration; the offline cutover happens next WSL boot.
+agentfs-migrate:
+  nix run .#agentfs -- migrate
+
+agentfs-status:
+  nix run .#agentfs -- status
+
+agentfs-verify:
+  nix run .#agentfs -- verify
+
+# Preserve current durable state and restore the retained ext4 home next boot.
+agentfs-rollback:
+  nix run .#agentfs -- rollback
+
+# Show HM news / build dry
+build:
+  nix build {{flake}}#homeConfigurations.\"{{host}}\".activationPackage
+
+# Copy devenv template into DEST (default .)
+devenv name dest=".":
+  bash scripts/templates/init-devenv.sh {{name}} {{dest}}

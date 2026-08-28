@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+	echo "usage: dev-apply [--check]" >&2
+	exit 2
+}
+check_only=false
+case ${1:-} in
+'') ;;
+--check) check_only=true ;;
+*) usage ;;
+esac
+
+source_root=${CHEZMOI_SOURCE_DIR:-"$HOME/.local/share/chezmoi"}
+[[ -d $source_root/home && -d $source_root/nix ]] || {
+	echo "dotfiles source not found at $source_root" >&2
+	exit 1
+}
+
+tmp=$(mktemp -d)
+trap 'rm -rf -- "$tmp"' EXIT
+chezmoi --source "$source_root" --destination "$tmp" apply --dry-run
+nix flake check "$source_root/nix" --no-pure-eval
+
+if $check_only; then
+	echo "dotfiles checks passed"
+	exit 0
+fi
+
+fstype=$(findmnt -rn -o FSTYPE "$HOME")
+[[ $fstype == btrfs ]] || {
+	echo "refusing Home Manager activation: $HOME is $fstype, expected verified AgentFS Btrfs" >&2
+	echo "complete docs/migration.md, then rerun dev-apply" >&2
+	exit 1
+}
+
+chezmoi --source "$source_root" apply
+nix run "$source_root/nix" -- switch
