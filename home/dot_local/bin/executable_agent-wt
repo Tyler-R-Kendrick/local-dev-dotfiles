@@ -59,12 +59,12 @@ add_workspace() {
 	fi
 
 	path=$(workspace_path "$branch")
-  mkdir -p "$(dirname "$path")"
-  if git show-ref --verify --quiet "refs/heads/$branch"; then
-    git worktree add --quiet "$path" "$branch"
-  else
-    git worktree add --quiet -b "$branch" "$path" "$start"
-  fi
+	mkdir -p "$(dirname "$path")"
+	if git show-ref --verify --quiet "refs/heads/$branch"; then
+		git worktree add --quiet "$path" "$branch"
+	else
+		git worktree add --quiet -b "$branch" "$path" "$start"
+	fi
 
 	sparse_policy="$source/$(policy_value '.workspace.sparsePolicy' '.agent/workspace.yaml')"
 	if [[ -f $sparse_policy ]]; then
